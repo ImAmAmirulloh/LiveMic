@@ -346,19 +346,161 @@ body {
     color: var(--text-primary);
 }
 
+/* ===== Listener List ===== */
+.listener-list {
+    margin-top: 32px;
+    background: var(--bg-card);
+    border-radius: 20px;
+    overflow: hidden;
+}
+
+.listener-list-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 16px 20px;
+    background: var(--bg-card-hover);
+    border-bottom: 1px solid var(--border);
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-secondary);
+}
+
+.listener-list-header svg {
+    color: var(--primary);
+}
+
+.listener-list-container {
+    max-height: 300px;
+    overflow-y: auto;
+}
+
+.listener-list-container::-webkit-scrollbar {
+    width: 6px;
+}
+
+.listener-list-container::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+.listener-list-container::-webkit-scrollbar-thumb {
+    background: var(--border);
+    border-radius: 3px;
+}
+
+.empty-list {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 40px 20px;
+    color: var(--text-secondary);
+}
+
+.empty-list svg {
+    margin-bottom: 12px;
+    opacity: 0.5;
+}
+
+.empty-list p {
+    font-size: 14px;
+}
+
+.listener-item {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 14px 20px;
+    border-bottom: 1px solid var(--border);
+    animation: slideIn 0.3s ease;
+}
+
+.listener-item:last-child {
+    border-bottom: none;
+}
+
+@keyframes slideIn {
+    from {
+        opacity: 0;
+        transform: translateX(-10px);
+    }
+    to {
+        opacity: 1;
+        transform: translateX(0);
+    }
+}
+
+.listener-avatar {
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, var(--secondary), #059669);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: white;
+    font-weight: 600;
+    font-size: 16px;
+    flex-shrink: 0;
+}
+
+.listener-info {
+    flex: 1;
+    min-width: 0;
+}
+
+.listener-name {
+    font-size: 15px;
+    font-weight: 500;
+    color: var(--text-primary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.listener-status {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--secondary);
+    margin-top: 2px;
+}
+
+.listener-status-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--secondary);
+    animation: blink 1.5s infinite;
+}
+
+.listener-join-time {
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+
 /* ===== Join Form ===== */
 .join-form {
     text-align: center;
 }
 
-.join-form label {
+.input-group {
+    margin-bottom: 20px;
+}
+
+.input-group label {
     display: block;
     font-size: 14px;
     color: var(--text-secondary);
     margin-bottom: 12px;
+    text-align: left;
+    max-width: 280px;
+    margin-left: auto;
+    margin-right: auto;
 }
 
-.join-form input {
+.join-form input[type="text"] {
     width: 100%;
     max-width: 280px;
     padding: 18px 24px;
@@ -366,24 +508,35 @@ body {
     border: 2px solid var(--border);
     background: var(--bg-card);
     color: var(--text-primary);
-    font-size: 24px;
-    font-weight: 700;
+    font-size: 16px;
+    font-weight: 500;
     text-align: center;
-    letter-spacing: 8px;
-    text-transform: uppercase;
-    margin-bottom: 20px;
     transition: border-color 0.3s ease;
 }
 
-.join-form input::placeholder {
+.join-form input[type="text"]::placeholder {
     color: var(--text-secondary);
-    font-size: 16px;
-    letter-spacing: 2px;
+    font-size: 14px;
+    letter-spacing: 0px;
+    font-weight: 400;
 }
 
-.join-form input:focus {
+.join-form input[type="text"]:focus {
     outline: none;
     border-color: var(--primary);
+}
+
+/* Room code input specific styling */
+#roomInput {
+    font-size: 24px !important;
+    font-weight: 700 !important;
+    letter-spacing: 8px;
+    text-transform: uppercase;
+}
+
+#roomInput::placeholder {
+    font-size: 16px !important;
+    letter-spacing: 2px;
 }
 
 .join-btn {
@@ -447,6 +600,16 @@ body {
     font-size: 18px;
     font-weight: 600;
     margin-bottom: 8px;
+}
+
+.user-name-text {
+    font-size: 14px;
+    color: var(--secondary);
+    margin-bottom: 8px;
+}
+
+.user-name-text strong {
+    color: var(--secondary);
 }
 
 .room-info-text {
