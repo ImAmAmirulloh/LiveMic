@@ -1,31 +1,41 @@
 /**
  * Live Mic - Audio Conference Application
  * Menggunakan WebRTC untuk real-time audio streaming
+ * Dengan Socket.IO signaling server
  */
+
+// ===== Configuration =====
+const CONFIG = {
+    // Server URL - ganti dengan URL server Anda
+    // Untuk development local: 'http://localhost:3000'
+    // Untuk production: URL server yang sudah di-deploy
+    SERVER_URL: window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
+        ? 'http://localhost:3000'
+        : window.location.origin,
+
+    // STUN/TURN servers untuk WebRTC
+    ICE_SERVERS: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:stun2.l.google.com:19302' }
+    ]
+};
 
 // ===== State Management =====
 const state = {
     mode: null, // 'speaker' or 'listener'
+    userName: null,
     roomCode: null,
     isLive: false,
     isConnected: false,
     localStream: null,
-    peerConnection: null,
+    peerConnections: new Map(), // Map of socketId -> RTCPeerConnection
     audioElement: null,
-    listenerCount: 0
-};
-
-// ===== Configuration =====
-const config = {
-    // STUN/TURN servers untuk WebRTC
-    iceServers: [
-        {
-            urls: 'stun:stun.l.google.com:19302'
-        },
-        {
-            urls: 'stun:stun1.l.google.com:19302'
-        }
-    ]
+    listenerCount: 0,
+    listeners: new Map(), // Map of socketId -> { name, joinedAt }
+    speakerName: null,
+    socket: null,
+    connectedPeers: new Set() // Track connected peers for audio
 };
 
 // ===== DOM Elements =====
@@ -39,11 +49,14 @@ const elements = {
     micStatus: document.getElementById('micStatus'),
     listenerCount: document.getElementById('listenerCount'),
     roomInput: document.getElementById('roomInput'),
+    nameInput: document.getElementById('nameInput'),
     listeningPanel: document.getElementById('listeningPanel'),
     currentRoom: document.getElementById('currentRoom'),
+    myName: document.getElementById('myName'),
     toast: document.getElementById('toast'),
     toastMessage: document.getElementById('toastMessage'),
-    permissionModal: document.getElementById('permissionModal')
+    permissionModal: document.getElementById('permissionModal'),
+    listenerListContainer: document.getElementById('listenerListContainer')
 };
 
 // ===== Utility Functions =====
@@ -79,7 +92,6 @@ async function copyToClipboard(text) {
         await navigator.clipboard.writeText(text);
         showToast('Kode berhasil disalin!');
     } catch (err) {
-        // Fallback for older browsers
         const textarea = document.createElement('textarea');
         textarea.value = text;
         document.body.appendChild(textarea);
@@ -90,12 +102,157 @@ async function copyToClipboard(text) {
     }
 }
 
+/**
+ * Get initials from name
+ */
+function getInitials(name) {
+    return name
+        .split(' ')
+        .map(n => n[0])
+        .join('')
+        .toUpperCase()
+        .slice(0, 2);
+}
+
+/**
+ * Format time ago
+ */
+function timeAgo(timestamp) {
+    const seconds = Math.floor((Date.now() - timestamp) / 1000);
+    if (seconds < 60) return 'Baru saja';
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return `${minutes}m ago`;
+    const hours = Math.floor(minutes / 60);
+    return `${hours}h ago`;
+}
+
+// ===== Socket.IO Connection =====
+
+/**
+ * Initialize Socket.IO connection
+ */
+function initSocket() {
+    // Load Socket.IO if not already loaded
+    if (!window.io) {
+        const script = document.createElement('script');
+        script.src = 'https://cdn.socket.io/4.7.2/socket.io.min.js';
+        script.onload = () => connectToServer();
+        document.head.appendChild(script);
+    } else {
+        connectToServer();
+    }
+}
+
+/**
+ * Connect to signaling server
+ */
+function connectToServer() {
+    state.socket = io(CONFIG.SERVER_URL, {
+        transports: ['websocket', 'polling']
+    });
+
+    state.socket.on('connect', () => {
+        console.log('Connected to signaling server');
+    });
+
+    state.socket.on('disconnect', () => {
+        console.log('Disconnected from signaling server');
+        showToast('Koneksi terputus. Menghubungkan ulang...');
+    });
+
+    state.socket.on('connect_error', (error) => {
+        console.error('Connection error:', error);
+        showToast('Gagal terhubung ke server. Pastikan server berjalan.');
+    });
+
+    // ===== Speaker Events =====
+    state.socket.on('listener-joined', (data) => {
+        console.log('Listener joined:', data);
+        addListener(data.socketId, data.name, data.joinedAt);
+        showToast(`${data.name} bergabung`);
+
+        // Send WebRTC offer to new listener
+        if (state.isLive && state.localStream) {
+            createOfferForListener(data.socketId);
+        }
+    });
+
+    state.socket.on('listener-left', (data) => {
+        console.log('Listener left:', data);
+        removeListener(data.socketId);
+        showToast(`${data.name} keluar`);
+
+        // Close peer connection
+        closePeerConnection(data.socketId);
+    });
+
+    state.socket.on('listener-count', (data) => {
+        state.listenerCount = data.count;
+        elements.listenerCount.textContent = data.count;
+    });
+
+    state.socket.on('speaker-live', () => {
+        showToast('Pembicara sedang live!');
+    });
+
+    state.socket.on('speaker-ended', () => {
+        showToast('Pembicara mengakhiri streaming');
+        leaveRoom();
+    });
+
+    // ===== WebRTC Signaling Events =====
+    state.socket.on('offer', async (data) => {
+        console.log('Received offer from:', data.fromName);
+        await handleOffer(data.offer, data.from, data.fromName);
+    });
+
+    state.socket.on('answer', async (data) => {
+        console.log('Received answer from:', data.from);
+        await handleAnswer(data.answer, data.from);
+    });
+
+    state.socket.on('ice-candidate', async (data) => {
+        await handleIceCandidate(data.candidate, data.from);
+    });
+
+    // ===== Listener: Handle speaker going live =====
+    state.socket.on('speaker-live', () => {
+        showToast('Pembicara sedang live!');
+        // Create peer connection to receive audio
+        if (state.mode === 'listener' && state.isConnected) {
+            createListenerPeerConnection();
+        }
+    });
+
+    state.socket.on('speaker-ended', () => {
+        showToast('Pembicara mengakhiri streaming');
+        // Close all peer connections
+        state.peerConnections.forEach((pc) => pc.close());
+        state.peerConnections.clear();
+        if (state.audioElement) {
+            state.audioElement.srcObject = null;
+        }
+        leaveRoom();
+    });
+}
+
 // ===== Navigation Functions =====
 
 /**
  * Select mode (speaker or listener)
  */
 function selectMode(mode) {
+    // Validate name for listener
+    if (mode === 'listener') {
+        const name = elements.nameInput.value.trim();
+        if (!name) {
+            showToast('Masukkan nama Anda terlebih dahulu');
+            elements.nameInput.focus();
+            return;
+        }
+        state.userName = name;
+    }
+
     state.mode = mode;
 
     if (mode === 'speaker') {
@@ -113,7 +270,6 @@ function selectMode(mode) {
  * Go back to mode selection
  */
 function goBack() {
-    // Stop any active streams
     if (state.isLive) {
         stopStreaming();
     }
@@ -121,11 +277,25 @@ function goBack() {
         leaveRoom();
     }
 
+    // Disconnect socket
+    if (state.socket) {
+        state.socket.disconnect();
+        state.socket = null;
+    }
+
     // Reset state
     state.mode = null;
+    state.userName = null;
     state.roomCode = null;
     state.isLive = false;
     state.isConnected = false;
+    state.listenerCount = 0;
+    state.listeners.clear();
+    state.connectedPeers.clear();
+
+    // Reset peer connections
+    state.peerConnections.forEach((pc) => pc.close());
+    state.peerConnections.clear();
 
     // Reset UI
     elements.micStatus.classList.remove('active');
@@ -133,11 +303,81 @@ function goBack() {
     elements.micBtnText.textContent = 'Tap to Go Live';
     elements.listeningPanel.classList.add('hidden');
     elements.roomInput.value = '';
+    elements.listenerCount.textContent = '0';
+    elements.nameInput.value = '';
+    renderListenerList();
 
     // Show mode selection
     elements.speakerSection.classList.add('hidden');
     elements.listenerSection.classList.add('hidden');
     elements.modeSection.classList.remove('hidden');
+}
+
+// ===== Listener List Functions =====
+
+/**
+ * Add listener to the list
+ */
+function addListener(socketId, name, joinedAt) {
+    state.listeners.set(socketId, { name, joinedAt });
+    state.listenerCount = state.listeners.size;
+    elements.listenerCount.textContent = state.listenerCount;
+    renderListenerList();
+}
+
+/**
+ * Remove listener from the list
+ */
+function removeListener(socketId) {
+    state.listeners.delete(socketId);
+    state.listenerCount = state.listeners.size;
+    elements.listenerCount.textContent = state.listenerCount;
+    renderListenerList();
+}
+
+/**
+ * Render listener list in UI
+ */
+function renderListenerList() {
+    if (state.listeners.size === 0) {
+        elements.listenerListContainer.innerHTML = `
+            <div class="empty-list">
+                <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <circle cx="12" cy="12" r="10"/>
+                    <line x1="12" y1="8" x2="12" y2="12"/>
+                    <line x1="12" y1="16" x2="12.01" y2="16"/>
+                </svg>
+                <p>Belum ada pendengar</p>
+            </div>
+        `;
+        return;
+    }
+
+    const html = Array.from(state.listeners.entries())
+        .map(([socketId, data]) => `
+            <div class="listener-item" data-id="${socketId}">
+                <div class="listener-avatar">${getInitials(data.name)}</div>
+                <div class="listener-info">
+                    <div class="listener-name">${escapeHtml(data.name)}</div>
+                    <div class="listener-status">
+                        <span class="listener-status-dot"></span>
+                        <span>Online</span>
+                    </div>
+                </div>
+                <div class="listener-join-time">${timeAgo(data.joinedAt)}</div>
+            </div>
+        `).join('');
+
+    elements.listenerListContainer.innerHTML = html;
+}
+
+/**
+ * Escape HTML to prevent XSS
+ */
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
 }
 
 // ===== Speaker Functions =====
@@ -183,20 +423,34 @@ async function startStreaming() {
             }
         });
 
-        state.isLive = true;
+        // Create room on server
+        state.socket.emit('create-room', {
+            roomCode: state.roomCode,
+            name: 'Speaker'
+        }, (response) => {
+            if (!response.success) {
+                showToast(response.error || 'Gagal membuat room');
+                return;
+            }
 
-        // Update UI
-        elements.micStatus.classList.add('active');
-        elements.micBtn.classList.add('live');
-        elements.micBtnText.textContent = 'Tap to End';
+            state.isLive = true;
+            state.isConnected = true;
 
-        // Initialize WebRTC connection
-        await initializeWebRTC();
+            // Update UI
+            elements.micStatus.classList.add('active');
+            elements.micBtn.classList.add('live');
+            elements.micBtnText.textContent = 'Tap to End';
 
-        showToast('Streaming aktif! Pendengar dapat mendengar Anda.');
+            // Notify server that speaker is live
+            state.socket.emit('go-live');
 
-        // Simulate listener count (in real app, this would come from server)
-        simulateListenerActivity();
+            // Re-create peer connections for all existing listeners
+            state.listeners.forEach((data, socketId) => {
+                createOfferForListener(socketId);
+            });
+
+            showToast('Streaming aktif! Pendengar dapat mendengar Anda.');
+        });
 
     } catch (err) {
         console.error('Error starting stream:', err);
@@ -209,17 +463,21 @@ async function startStreaming() {
  * Stop audio streaming
  */
 function stopStreaming() {
+    // Notify server
+    if (state.socket && state.isConnected) {
+        state.socket.emit('end-live');
+    }
+
     // Stop all tracks
     if (state.localStream) {
         state.localStream.getTracks().forEach(track => track.stop());
         state.localStream = null;
     }
 
-    // Close peer connection
-    if (state.peerConnection) {
-        state.peerConnection.close();
-        state.peerConnection = null;
-    }
+    // Close all peer connections
+    state.peerConnections.forEach((pc) => pc.close());
+    state.peerConnections.clear();
+    state.connectedPeers.clear();
 
     state.isLive = false;
 
@@ -227,74 +485,8 @@ function stopStreaming() {
     elements.micStatus.classList.remove('active');
     elements.micBtn.classList.remove('live');
     elements.micBtnText.textContent = 'Tap to Go Live';
-    elements.listenerCount.textContent = '0';
 
     showToast('Streaming dihentikan.');
-}
-
-/**
- * Initialize WebRTC peer connection
- */
-async function initializeWebRTC() {
-    // Create peer connection
-    state.peerConnection = new RTCPeerConnection(config);
-
-    // Add local stream tracks
-    if (state.localStream) {
-        state.localStream.getTracks().forEach(track => {
-            state.peerConnection.addTrack(track, state.localStream);
-        });
-    }
-
-    // Handle ICE candidates
-    state.peerConnection.onicecandidate = (event) => {
-        if (event.candidate) {
-            // Send ICE candidate to signaling server
-            console.log('ICE candidate:', event.candidate);
-            // sendToSignalingServer({
-            //     type: 'ice-candidate',
-            //     candidate: event.candidate,
-            //     roomCode: state.roomCode
-            // });
-        }
-    };
-
-    // Handle connection state changes
-    state.peerConnection.onconnectionstatechange = () => {
-        console.log('Connection state:', state.peerConnection.connectionState);
-    };
-
-    // Create offer for new connections
-    if (state.peerConnection.signalingState === 'stable') {
-        const offer = await state.peerConnection.createOffer();
-        await state.peerConnection.setLocalDescription(offer);
-
-        // Send offer to signaling server
-        console.log('WebRTC offer created');
-        // sendToSignalingServer({
-        //     type: 'offer',
-        //     offer: offer,
-        //     roomCode: state.roomCode
-        // });
-    }
-}
-
-/**
- * Simulate listener activity (for demo purposes)
- */
-function simulateListenerActivity() {
-    // Simulate random listeners joining
-    const interval = setInterval(() => {
-        if (!state.isLive) {
-            clearInterval(interval);
-            return;
-        }
-
-        // Random chance for listener count to change
-        const change = Math.floor(Math.random() * 3) - 1;
-        state.listenerCount = Math.max(0, state.listenerCount + change + 1);
-        elements.listenerCount.textContent = state.listenerCount;
-    }, 3000);
 }
 
 /**
@@ -304,93 +496,293 @@ function copyRoomCode() {
     copyToClipboard(state.roomCode);
 }
 
+// ===== WebRTC Functions =====
+
+/**
+ * Create WebRTC peer connection
+ */
+function createPeerConnection(targetSocketId) {
+    if (state.peerConnections.has(targetSocketId)) {
+        return state.peerConnections.get(targetSocketId);
+    }
+
+    const pc = new RTCPeerConnection({ iceServers: CONFIG.ICE_SERVERS });
+
+    // Add local stream tracks
+    if (state.localStream) {
+        state.localStream.getTracks().forEach(track => {
+            pc.addTrack(track, state.localStream);
+        });
+    }
+
+    // Handle ICE candidates
+    pc.onicecandidate = (event) => {
+        if (event.candidate) {
+            console.log('Sending ICE candidate to:', targetSocketId);
+            state.socket.emit('ice-candidate', {
+                candidate: event.candidate,
+                to: targetSocketId,
+                type: 'speaker'
+            });
+        }
+    };
+
+    // Handle connection state changes
+    pc.onconnectionstatechange = () => {
+        console.log(`Connection with ${targetSocketId}:`, pc.connectionState);
+        if (pc.connectionState === 'connected') {
+            state.connectedPeers.add(targetSocketId);
+        } else if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
+            state.connectedPeers.delete(targetSocketId);
+        }
+    };
+
+    state.peerConnections.set(targetSocketId, pc);
+    return pc;
+}
+
+/**
+ * Create offer for listener
+ */
+async function createOfferForListener(listenerSocketId) {
+    const pc = createPeerConnection(listenerSocketId);
+
+    try {
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+
+        console.log('Sending offer to:', listenerSocketId);
+        state.socket.emit('offer', {
+            offer: pc.localDescription,
+            to: listenerSocketId
+        });
+    } catch (err) {
+        console.error('Error creating offer:', err);
+    }
+}
+
+/**
+ * Handle incoming offer from listener
+ */
+async function handleOffer(offer, fromSocketId, fromName) {
+    const pc = createPeerConnection(fromSocketId);
+
+    try {
+        await pc.setRemoteDescription(new RTCSessionDescription(offer));
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+
+        console.log('Sending answer to:', fromSocketId);
+        state.socket.emit('answer', {
+            answer: pc.localDescription,
+            to: fromSocketId
+        });
+
+        // Add to listeners if not already
+        if (!state.listeners.has(fromSocketId)) {
+            addListener(fromSocketId, fromName, Date.now());
+        }
+    } catch (err) {
+        console.error('Error handling offer:', err);
+    }
+}
+
+/**
+ * Handle incoming answer from speaker
+ */
+async function handleAnswer(answer, fromSocketId) {
+    const pc = state.peerConnections.get(fromSocketId);
+    if (!pc) {
+        console.error('No peer connection found for:', fromSocketId);
+        return;
+    }
+
+    try {
+        await pc.setRemoteDescription(new RTCSessionDescription(answer));
+    } catch (err) {
+        console.error('Error handling answer:', err);
+    }
+}
+
+/**
+ * Handle incoming ICE candidate
+ */
+async function handleIceCandidate(candidate, fromSocketId) {
+    const pc = state.peerConnections.get(fromSocketId);
+    if (!pc) {
+        console.error('No peer connection found for:', fromSocketId);
+        return;
+    }
+
+    try {
+        await pc.addIceCandidate(new RTCIceCandidate(candidate));
+    } catch (err) {
+        console.error('Error adding ICE candidate:', err);
+    }
+}
+
+/**
+ * Close peer connection
+ */
+function closePeerConnection(socketId) {
+    const pc = state.peerConnections.get(socketId);
+    if (pc) {
+        pc.close();
+        state.peerConnections.delete(socketId);
+        state.connectedPeers.delete(socketId);
+    }
+}
+
+// ===== Listener WebRTC Functions =====
+
+/**
+ * Create peer connection for listener to receive audio from speaker
+ */
+function createListenerPeerConnection() {
+    // For listener, we need to connect to the speaker
+    // The speaker socket ID is stored when joining
+    // We'll create a connection and wait for the offer
+
+    const pc = new RTCPeerConnection({ iceServers: CONFIG.ICE_SERVERS });
+
+    // Handle incoming tracks (audio from speaker)
+    pc.ontrack = (event) => {
+        console.log('Received audio track from speaker:', event.track);
+        if (state.audioElement) {
+            state.audioElement.srcObject = event.streams[0];
+            // Try to play
+            state.audioElement.play().catch(err => {
+                console.log('Auto-play prevented, user interaction required');
+            });
+        }
+    };
+
+    // Handle ICE candidates
+    pc.onicecandidate = (event) => {
+        if (event.candidate) {
+            console.log('Sending ICE candidate to speaker');
+            state.socket.emit('ice-candidate', {
+                candidate: event.candidate,
+                type: 'listener'
+            });
+        }
+    };
+
+    // Handle connection state
+    pc.onconnectionstatechange = () => {
+        console.log('Listener connection state:', pc.connectionState);
+        if (pc.connectionState === 'connected') {
+            showToast('Terhubung ke pembicara!');
+        }
+    };
+
+    // Store the peer connection
+    state.peerConnections.set('speaker', pc);
+    return pc;
+}
+
+/**
+ * Handle answer from speaker (for listener)
+ */
+async function handleAnswer(answer, fromSocketId) {
+    const pc = state.peerConnections.get('speaker') || state.peerConnections.get(fromSocketId);
+    if (!pc) {
+        console.error('No peer connection found for listener');
+        return;
+    }
+
+    try {
+        await pc.setRemoteDescription(new RTCSessionDescription(answer));
+    } catch (err) {
+        console.error('Error handling answer:', err);
+    }
+}
+
 // ===== Listener Functions =====
 
 /**
  * Join a room
  */
 async function joinRoom() {
+    const name = elements.nameInput.value.trim();
     const roomCode = elements.roomInput.value.trim().toUpperCase();
 
-    if (roomCode.length < 4) {
-        showToast('Masukkan kode room yang valid');
+    if (!name) {
+        showToast('Masukkan nama Anda terlebih dahulu');
+        elements.nameInput.focus();
         return;
     }
 
+    if (roomCode.length < 4) {
+        showToast('Masukkan kode room yang valid');
+        elements.roomInput.focus();
+        return;
+    }
+
+    state.userName = name;
     state.roomCode = roomCode;
 
     try {
         // Request microphone for echo cancellation
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        stream.getTracks().forEach(track => track.stop()); // Stop after getting permission
+        stream.getTracks().forEach(track => track.stop());
 
         // Connect to room
-        await connectToRoom(roomCode);
+        state.socket.emit('join-room', {
+            roomCode: roomCode,
+            name: name
+        }, (response) => {
+            if (!response.success) {
+                showToast(response.error || 'Gagal bergabung');
+                return;
+            }
 
-        // Update UI
-        elements.listeningPanel.classList.remove('hidden');
-        elements.currentRoom.textContent = roomCode;
-        state.isConnected = true;
+            state.speakerName = response.speakerName;
+            state.isConnected = true;
 
-        showToast('Berhasil bergabung dengan room!');
+            // Create audio element for receiving audio
+            state.audioElement = document.createElement('audio');
+            state.audioElement.autoplay = true;
+            state.audioElement.volume = 1.0;
+
+            // Update UI
+            elements.listeningPanel.classList.remove('hidden');
+            elements.currentRoom.textContent = roomCode;
+            elements.myName.textContent = name;
+
+            // Add existing listeners
+            if (response.listeners) {
+                response.listeners.forEach(listener => {
+                    if (listener.id !== state.socket.id) {
+                        state.listeners.set(listener.id, { name: listener.name, joinedAt: listener.joinedAt });
+                    }
+                });
+            }
+            renderListenerList();
+
+            showToast(`Berhasil bergabung dengan room ${roomCode}!`);
+        });
 
     } catch (err) {
         console.error('Error joining room:', err);
-        showToast('Gagal bergabung. Coba lagi.');
+        showToast('Gagal mengakses mikrofon. Pastikan izin diberikan.');
     }
-}
-
-/**
- * Connect to room via WebRTC
- */
-async function connectToRoom(roomCode) {
-    // Create peer connection
-    state.peerConnection = new RTCPeerConnection(config);
-
-    // Create audio element for receiving audio
-    state.audioElement = document.createElement('audio');
-    state.audioElement.autoplay = true;
-
-    // Handle incoming tracks
-    state.peerConnection.ontrack = (event) => {
-        console.log('Received remote track:', event.track);
-        state.audioElement.srcObject = event.streams[0];
-    };
-
-    // Handle ICE candidates
-    state.peerConnection.onicecandidate = (event) => {
-        if (event.candidate) {
-            console.log('ICE candidate:', event.candidate);
-            // sendToSignalingServer({
-            //     type: 'ice-candidate',
-            //     candidate: event.candidate,
-            //     roomCode: roomCode
-            // });
-        }
-    };
-
-    // Create offer
-    const offer = await state.peerConnection.createOffer();
-    await state.peerConnection.setLocalDescription(offer);
-
-    // Send offer to signaling server
-    console.log('Joining room:', roomCode);
-    // sendToSignalingServer({
-    //     type: 'join-room',
-    //     offer: offer,
-    //     roomCode: roomCode
-    // });
 }
 
 /**
  * Leave current room
  */
 function leaveRoom() {
-    // Close peer connection
-    if (state.peerConnection) {
-        state.peerConnection.close();
-        state.peerConnection = null;
+    // Disconnect socket
+    if (state.socket) {
+        state.socket.disconnect();
+        state.socket = null;
     }
+
+    // Close all peer connections
+    state.peerConnections.forEach((pc) => pc.close());
+    state.peerConnections.clear();
+    state.connectedPeers.clear();
 
     // Stop audio element
     if (state.audioElement) {
@@ -398,178 +790,54 @@ function leaveRoom() {
         state.audioElement = null;
     }
 
+    // Reset state
     state.isConnected = false;
+    state.listeners.clear();
+    state.speakerName = null;
 
     // Update UI
     elements.listeningPanel.classList.add('hidden');
     elements.roomInput.value = '';
+    renderListenerList();
 
     showToast('Anda telah keluar dari room.');
 }
 
-// ===== Signaling Server Functions =====
+// ===== Initialize =====
 
-/**
- * Placeholder for signaling server connection
- * Dalam implementasi nyata, Anda perlu:
- * 1. WebSocket server untuk real-time messaging
- * 2. Room management untuk multiple rooms
- * 3. User authentication dan authorization
- */
-const signalingServer = {
-    socket: null,
-
-    connect() {
-        // Contoh koneksi WebSocket
-        // this.socket = new WebSocket('wss://your-signaling-server.com');
-
-        // this.socket.onopen = () => {
-        //     console.log('Connected to signaling server');
-        // };
-
-        // this.socket.onmessage = (event) => {
-        //     const data = JSON.parse(event.data);
-        //     handleSignalingMessage(data);
-        // };
-
-        // this.socket.onclose = () => {
-        //     console.log('Disconnected from signaling server');
-        // };
-    },
-
-    send(data) {
-        // if (this.socket && this.socket.readyState === WebSocket.OPEN) {
-        //     this.socket.send(JSON.stringify(data));
-        // }
-    }
-};
-
-/**
- * Handle messages from signaling server
- */
-function handleSignalingMessage(data) {
-    switch (data.type) {
-        case 'offer':
-            handleOffer(data.offer, data.from);
-            break;
-        case 'answer':
-            handleAnswer(data.answer);
-            break;
-        case 'ice-candidate':
-            handleIceCandidate(data.candidate);
-            break;
-        case 'user-joined':
-            console.log('User joined:', data.userId);
-            break;
-        case 'user-left':
-            console.log('User left:', data.userId);
-            break;
-        case 'listener-count':
-            state.listenerCount = data.count;
-            elements.listenerCount.textContent = state.listenerCount;
-            break;
-    }
-}
-
-/**
- * Handle incoming offer
- */
-async function handleOffer(offer, from) {
-    const answer = await state.peerConnection.createAnswer();
-    await state.peerConnection.setLocalDescription(answer);
-
-    signalingServer.send({
-        type: 'answer',
-        answer: answer,
-        to: from
-    });
-}
-
-/**
- * Handle incoming answer
- */
-async function handleAnswer(answer) {
-    await state.peerConnection.setRemoteDescription(new RTCSessionDescription(answer));
-}
-
-/**
- * Handle incoming ICE candidate
- */
-async function handleIceCandidate(candidate) {
-    try {
-        await state.peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
-    } catch (err) {
-        console.error('Error adding ICE candidate:', err);
-    }
-}
-
-// ===== Audio Processing =====
-
-/**
- * Create audio context for processing
- */
-function createAudioContext() {
-    const audioContext = new (window.AudioContext || window.webkitAudioContext)();
-    return audioContext;
-}
-
-/**
- * Process audio with effects (optional)
- */
-function processAudio(stream, audioContext) {
-    const source = audioContext.createMediaStreamSource(stream);
-    const analyser = audioContext.createAnalyser();
-
-    source.connect(analyser);
-
-    analyser.fftSize = 256;
-    const bufferLength = analyser.frequencyBinCount;
-    const dataArray = new Uint8Array(bufferLength);
-
-    function draw() {
-        requestAnimationFrame(draw);
-        analyser.getByteFrequencyData(dataArray);
-        // Update visualizer here
-    }
-
-    draw();
-
-    return analyser;
-}
-
-// ===== Event Listeners =====
-
-// Handle permission modal close on backdrop click
+// Event Listeners
 elements.permissionModal.addEventListener('click', (e) => {
     if (e.target === elements.permissionModal) {
         closePermissionModal();
     }
 });
 
-// Handle Enter key on room input
 elements.roomInput.addEventListener('keypress', (e) => {
     if (e.key === 'Enter') {
         joinRoom();
     }
 });
 
-// Handle visibility change (pause/resume)
 document.addEventListener('visibilitychange', () => {
     if (document.hidden && state.isLive) {
         showToast('Streaming berjalan di background');
     }
 });
 
-// Initialize on load
+// Initialize Socket.IO on load
 window.addEventListener('load', () => {
     console.log('Live Mic App initialized');
     console.log('WebRTC support:', !!window.RTCPeerConnection);
     console.log('MediaDevices support:', !!navigator.mediaDevices);
+    console.log('Socket.IO will connect to:', CONFIG.SERVER_URL);
+
+    initSocket();
 });
 
-// ===== Export for debugging =====
+// Export for debugging
 window.liveMic = {
     state,
+    config: CONFIG,
     startStreaming,
     stopStreaming,
     joinRoom,
