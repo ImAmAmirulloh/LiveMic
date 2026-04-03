@@ -6,12 +6,8 @@
 
 // ===== Configuration =====
 const CONFIG = {
-    // Server URL - ganti dengan URL server Anda
-    // Untuk development local: 'http://localhost:3000'
-    // Untuk production: URL server yang sudah di-deploy
-    SERVER_URL: window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
-        ? 'http://localhost:3000'
-        : window.location.origin,
+    // Railway Server URL
+    SERVER_URL: 'https://reliable-clarity.up.railway.app',
 
     // STUN/TURN servers untuk WebRTC
     ICE_SERVERS: [
